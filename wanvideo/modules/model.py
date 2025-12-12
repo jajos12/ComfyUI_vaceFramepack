@@ -8,6 +8,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat, rearrange
 from ...enhance_a_video.enhance import get_feta_scores
 from ...enhance_a_video.globals import is_enhance_enabled
+from ...framepack_helpers import FramePackManager
 
 try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention, BlockMask
@@ -217,6 +218,19 @@ class WanSelfAttention(nn.Module):
         if self.attention_mode == 'flex_attention':
             if rope_func == "comfy":
                 roped_query, roped_key = apply_rope_comfy(q, k, freqs)
+            elif rope_func == "custom_flattened":
+                # Simple RoPE application for flattened sequences
+                # q, k: [B, L, N, D]
+                # freqs: [L, D/2] (Complex)
+                
+                def apply_rope_simple(x, freqs):
+                    b, l, n, d = x.shape
+                    x_complex = torch.view_as_complex(x.float().reshape(b, l, n, -1, 2))
+                    freqs_complex = freqs.view(1, l, 1, -1)
+                    return torch.view_as_real(x_complex * freqs_complex).flatten(3).type_as(x)
+
+                roped_query = apply_rope_simple(q, freqs)
+                roped_key = apply_rope_simple(k, freqs)
             else:
                 roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
                 roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
@@ -251,6 +265,15 @@ class WanSelfAttention(nn.Module):
         else:
             if rope_func == "comfy":
                 q, k = apply_rope_comfy(q, k, freqs)
+            elif rope_func == "custom_flattened":
+                def apply_rope_simple(x, freqs):
+                    b, l, n, d = x.shape
+                    x_complex = torch.view_as_complex(x.float().reshape(b, l, n, -1, 2))
+                    freqs_complex = freqs.view(1, l, 1, -1)
+                    return torch.view_as_real(x_complex * freqs_complex).flatten(3).type_as(x)
+
+                q = apply_rope_simple(q, freqs)
+                k = apply_rope_simple(k, freqs)
             else:
                 q=rope_apply(q, grid_sizes, freqs)
                 k=rope_apply(k, grid_sizes, freqs)
@@ -600,7 +623,9 @@ class WanAttentionBlock(nn.Module):
         is_uncond=False,
         multitalk_audio_embedding=None,
         ref_target_masks=None,
-        human_num=0
+        human_num=0,
+        history_x=None,
+        history_freqs=None
     ):
         r"""
         Args:
@@ -614,6 +639,27 @@ class WanAttentionBlock(nn.Module):
         e = self.get_mod(e)
 
         input_x = self.modulate(self.norm1(x), e)
+
+        if history_x is not None:
+            h_input = self.modulate(self.norm1(history_x), e)
+            input_x = torch.cat([h_input, input_x], dim=1)
+            
+            # Update freqs
+            # Generate positional freqs for current sequence
+            current_grid = grid_sizes[0]
+            F_curr = current_grid[0].item()
+            schedule_curr = [{'start': 0, 'end': F_curr, 'compression': 1}]
+            
+            current_pos_freqs = FramePackManager.generate_compressed_freqs(
+                schedule_curr,
+                self.self_attn.dim // self.self_attn.num_heads,
+                current_grid,
+                x.device
+            )
+            
+            freqs = torch.cat([history_freqs, current_pos_freqs], dim=0)
+            rope_func = "custom_flattened"
+            block_mask = None
 
         if camera_embed is not None:
             # encode ReCamMaster camera
@@ -647,7 +693,11 @@ class WanAttentionBlock(nn.Module):
 
         del input_x
 
-        x = x + (y * e[2])
+        if history_x is not None:
+            x_combined_residual = torch.cat([history_x, x], dim=1)
+            x = x_combined_residual + (y * e[2])
+        else:
+            x = x + (y * e[2])
         del y
 
         # cross-attention & ffn function
@@ -666,6 +716,13 @@ class WanAttentionBlock(nn.Module):
             x = x + (y * e[5])
 
         del e
+        
+        if history_x is not None:
+            h_len = history_x.shape[1]
+            history_x_out = x[:, :h_len]
+            x_out = x[:, h_len:]
+            return x_out, history_x_out
+            
         return x
     #@torch.compiler.disable()
     def cross_attn_ffn(self, x, context, context_lens, e, clip_embed=None, grid_sizes=None, 
@@ -1253,7 +1310,8 @@ class WanModel(ModelMixin, ConfigMixin):
         nag_params={},
         nag_context=None,
         multitalk_audio=None,
-        ref_target_masks=None
+        ref_target_masks=None,
+        framepack_history=None
     ):
         r"""
         Forward pass through the diffusion model
@@ -1393,6 +1451,41 @@ class WanModel(ModelMixin, ConfigMixin):
                 freqs = self.rope_embedder(img_ids).movedim(1, 2)
         else:
             rope_func = "default"
+
+        # FramePack Logic
+        history_x = None
+        history_freqs = None
+        
+        if framepack_history is not None and len(framepack_history) > 0:
+            # Concatenate all history latents
+            full_history = torch.cat(framepack_history, dim=2).to(device)
+            total_history_frames = full_history.shape[2]
+            
+            # Calculate schedule
+            schedule = FramePackManager.calculate_schedule(total_history_frames, total_history_frames)
+            
+            # Embed
+            history_emb = self.original_patch_embedding(full_history.float()).to(x[0].dtype)
+            
+            # Pool
+            compressed_chunks = FramePackManager.pool_latents(history_emb, schedule, device)
+            
+            if compressed_chunks:
+                # Flatten and concatenate
+                history_x_list = []
+                for chunk in compressed_chunks:
+                    flat = chunk.flatten(2).transpose(1, 2)
+                    history_x_list.append(flat)
+                
+                history_x = torch.cat(history_x_list, dim=1)
+                
+                # Generate RoPE
+                history_freqs = FramePackManager.generate_compressed_freqs(
+                    schedule,
+                    self.dim // self.num_heads,
+                    history_emb.shape[2:],
+                    device
+                )
 
         # time embeddings
         if t.dim() == 2:
@@ -1603,7 +1696,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 is_uncond = is_uncond,
                 multitalk_audio_embedding=multitalk_audio_embedding if multitalk_audio is not None else None,
                 ref_target_masks=token_ref_target_masks if multitalk_audio is not None else None,
-                human_num=human_num if multitalk_audio is not None else 0
+                human_num=human_num if multitalk_audio is not None else 0,
+                history_x=history_x,
+                history_freqs=history_freqs
                 )
             
             if vace_data is not None:
@@ -1648,7 +1743,13 @@ class WanModel(ModelMixin, ConfigMixin):
                             continue
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.main_device)
-                x = block(x, **kwargs)
+                
+                out = block(x, **kwargs)
+                if isinstance(out, tuple):
+                    x, history_x = out
+                    kwargs['history_x'] = history_x
+                else:
+                    x = out
 
                 #uni3c controlnet
                 if pdc_controlnet_states is not None and b < len(pdc_controlnet_states):
